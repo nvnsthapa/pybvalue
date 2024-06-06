@@ -1,3 +1,4 @@
+[![DOI](https://zenodo.org/badge/811449976.svg)](https://zenodo.org/doi/10.5281/zenodo.11508510)
 # pybvalue
 This repository contains spatial mapping of b-value of earthquakes at Salton Trough and Imperial valley, Southern California. 
 Workflow for spatail mapping of b-value of earthquakes includes the following steps: 
