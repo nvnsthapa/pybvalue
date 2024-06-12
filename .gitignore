@@ -163,3 +163,11 @@ cython_debug/
 .DS_Store
 example/data/event_catalog.csv
 example/plots/plotsSalton_Trough_Seismicity.pdf
+example/data/geothermal/Brawley_geothermal.xlsx
+example/data/sc_1981_2022q1_1d_3d_gc_soda.gc
+geothermal_salton/data/gc_only.gc
+geothermal_salton/data/Brawley_geothermal.xlsx
+geothermal_salton/data/Brawley_geothermal.csv
+example/plots/Salton_Trough_wholecatalog.pdf
+example/data/NOTES_hys_1981_2022_rev_A.pdf
+example/data/gc_only.gc
