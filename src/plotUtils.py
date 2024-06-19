@@ -156,6 +156,15 @@ def plot_welldata(catalog_df, well_df):
     pen="black",
     label="Milford Town",
 )
+    
+    fig.plot(
+    x=-112.853284,
+    y=38.488842,
+    fill="red",
+    style="s0.30s",
+    pen="black",
+    label="Blundell Geothermal Plant",
+)
 
     fig.colorbar(frame="af+lDepth (km)")
     # Legend in the upper right
