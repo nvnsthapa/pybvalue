@@ -47,8 +47,6 @@ def read_cat_relocated(relocatedCatalogF):
     return relocatedCat
 
 
-
-
 def create_magnitude_legend_file(mag_min, mag_max, filename='quake_mag_sym.txt'):
     """
     Create a legend file for GMT plot
