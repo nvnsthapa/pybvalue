@@ -37,10 +37,11 @@ def plot_seismicity(catalog_df):
     pygmt.config(MAP_TICK_LENGTH="0.4c") 
     pygmt.config(MAP_TICK_PEN="0.07c") 
 
-    fig.basemap(region=region, projection="M15c", frame=True,)
+    fig.basemap(region=region, projection="M15i", frame=["af", "WSne"])
     land = fig.grdimage(grid=grid_map, cmap="grayC", shading=True)
+    # land = fig.grdimage(grid=grid_map, cmap="grayC", shading=True)
     fig.coast(land=land, borders=["1/1p,black"], water='skyblue', shorelines=True, resolution='f')
-    pygmt.makecpt(cmap="seis", series=[catalog_df.depth.min(), 20])
+    pygmt.makecpt(cmap="seis", series=[0, 30])
 
     fig.plot(
         x=catalog_df.longitude,
@@ -54,6 +55,18 @@ def plot_seismicity(catalog_df):
         transparency=50,
     )
     fig.colorbar(frame="af+lDepth (km)")
+    # Coso geothermal field lat, lon range
+    latmin = 35.90
+    latmax = 36.17
+    lonmin = -118.00
+    lonmax = -117.67
+    #plot closed polygon around the geothermal field
+    fig.plot(
+        x=[lonmin, lonmax, lonmax, lonmin, lonmin],
+        y=[latmin, latmin, latmax, latmax, latmin],
+        pen="1p,black",)
+        # color="black",
+
     # Legend in the upper right
     # fig.legend(spec='quake_mag_sym.txt', position="jTR+o0.1c")
     # fig.savefig(f"Sesimicity_{filename}.pdf", dpi=600)
@@ -61,7 +74,7 @@ def plot_seismicity(catalog_df):
     return fig
 
 
-def plot_welldata(catalog_df, well_df):
+def plot_welldata(catalog_df, well_df, faultFile=None):
     """
     Plot seismicity using GMT
     Args:
@@ -91,8 +104,7 @@ def plot_welldata(catalog_df, well_df):
         region=region,
     )
 
-
-    fig.basemap(region=region, projection="M4i", frame=True,)
+    fig.basemap(region=region, projection="M6i", frame=["af", "WSne"])
     # land = fig.grdimage(grid=grid_map, cmap="grayC", shading=True)
     land = fig.grdimage(grid=grid_map, cmap="grayC", shading=True)
     fig.coast(region = land, borders=["1/1p,black"], water='skyblue', shorelines=True, resolution='f')
@@ -110,33 +122,33 @@ def plot_welldata(catalog_df, well_df):
         transparency=50,
     )
     #plot earthquake that are greater than 3.0 magnitude and less than 4.0 magnitude
-    filtered_eq = catalog_df[catalog_df.mag >= 3.5]
+    # filtered_eq = catalog_df[catalog_df.mag >= 3.5]
     # filtered_eq = filtered_eq[filtered_eq.mag <= 4.0]
     # filtered_eq = filtered_eq[filtered_eq.time <= '2000-01-01']
     # datefilter = catalog_df[catalog_df.mag >= 3.5]
-    print(filtered_eq)
+#     print(filtered_eq)
 
 
-    fig.plot(x=filtered_eq.longitude, 
-             y=filtered_eq.latitude, 
-            # fill="red",
-             style="c0.3c", 
-             pen="1p,black")
+#     fig.plot(x=filtered_eq.longitude, 
+#              y=filtered_eq.latitude, 
+#             # fill="red",
+#              style="c0.3c", 
+#              pen="1p,black")
     
-    fig.plot(x=filtered_eq.longitude, 
-             y=filtered_eq.latitude, 
-            fill="red",
-             style="a0.3c", 
-             pen="red")
+#     fig.plot(x=filtered_eq.longitude, 
+#              y=filtered_eq.latitude, 
+#             fill="red",
+#              style="a0.3c", 
+#              pen="red")
 
-    inj_well = well_df[well_df['STATUS'] == 'I']
-    production_well = well_df[well_df['STATUS'] == 'P']
+    inj_well = well_df[well_df['welltype'] == 'I']
+    production_well = well_df[well_df['welltype'] == 'P']
 
     fig.plot(
         x=inj_well.Longitude,
         y=inj_well.Latitude,
         fill="blue",
-        style="s0.25s",
+        style="s0.4s",
         pen="black",
     )
 
@@ -144,29 +156,34 @@ def plot_welldata(catalog_df, well_df):
     x=production_well.Longitude,
     y=production_well.Latitude,
     fill="green",
-    style="s0.25s",
+    style="s0.4s",
     pen="black",
 )
     
+    #plot fault data
     fig.plot(
-    x=-113.010829,
-    y=38.3966,
-    fill="white",
-    style="s0.30s",
-    pen="black",
-    label="Milford Town",
-)
-    
-    fig.plot(
-    x=-112.853284,
-    y=38.488842,
-    fill="red",
-    style="s0.30s",
-    pen="black",
-    label="Blundell Geothermal Plant",
-)
+        data = faultFile,
 
-    fig.colorbar(frame="af+lDepth (km)")
+    )
+#     fig.plot(
+#     x=-113.010829,
+#     y=38.3966,
+#     fill="white",
+#     style="s0.30s",
+#     pen="black",
+#     label="Milford Town",
+# )
+    
+#     fig.plot(
+#     x=-112.853284,
+#     y=38.488842,
+#     fill="red",
+#     style="s0.30s",
+#     pen="black",
+#     label="Blundell Geothermal Plant",
+# )
+
+    # fig.colorbar(frame="af+lDepth (km)")
     # Legend in the upper right
     # fig.legend(spec='quake_mag_sym.txt', position="jTR+o0.1c")
     # fig.savefig(f"Sesimicity_{filename}.pdf", dpi=600)
