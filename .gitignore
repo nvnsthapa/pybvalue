@@ -171,3 +171,20 @@ geothermal_salton/data/Brawley_geothermal.csv
 example/plots/Salton_Trough_wholecatalog.pdf
 example/data/NOTES_hys_1981_2022_rev_A.pdf
 example/data/gc_only.gc
+
+# ---- pybvalue project ----
+# Reference clone: github.com/tgoebel/magnitude-distribution (FMD/Mc/b-value engine)
+magnitude-distribution/
+
+# All generated figures and files land in output/<step>/ - keep the
+# directory skeleton, ignore everything produced inside it
+output/**
+!output/**/
+!output/**/.gitkeep
+
+# Reference papers (copyrighted - keep local, do not redistribute)
+refs/*.pdf
+
+# Large catalogs not redistributed here
+data/*.gc
+data/*.mat
