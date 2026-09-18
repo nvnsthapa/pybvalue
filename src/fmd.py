@@ -279,13 +279,180 @@ def mc_maxcurv(magnitudes, binsize=0.1):
     return float(edges[:-1][counts.argmax()] + binsize / 2)
 
 
-def mc_vs_time(times, magnitudes, window=500, step=10, binsize=0.1):
+def _ks_distance_powerlaw(above_mc, mc):
     """
-    Completeness as a function of time, following Wiemer & Wyss (2000):
-    a sliding window of fixed event count, Mc by maximum curvature in each.
+    Max distance between the observed and power-law-modelled cumulative
+    distributions above a candidate completeness (Clauset et al. 2009).
+
+    Args:
+        above_mc (array-like): magnitudes >= mc (any order)
+        mc (float): the candidate completeness
+    Returns:
+        float: KS distance, or inf for an empty sample
+    """
+    x = 10.0 ** np.asarray(above_mc, dtype=float)
+    xmin = 10.0 ** mc
+    n = x.size
+    if n == 0:
+        return np.inf
+    with np.errstate(divide="ignore"):
+        # A candidate near the sparse tail can have every event at exactly
+        # the same magnitude (log(x/xmin) sums to zero); alpha is then
+        # legitimately infinite - the model collapses to a point mass at
+        # xmin, which is a valid (if degenerate) comparison, not an error.
+        alpha = n / np.log(x / xmin).sum()
+    observed = np.arange(n, dtype=float) / n
+    modelled = 1.0 - (xmin / x) ** alpha
+    return float(np.abs(observed - modelled).max())
+
+
+def ks_candidate_grid(magnitudes, step=0.1):
+    """
+    A coarse, evenly-spaced grid of Mc candidates spanning `magnitudes`'
+    range. Mc is never asserted finer than a catalog's own bin size, so
+    searching every unique value (mc_ks()'s default, and Goebel's) is wasted
+    resolution once a sample is more than a few hundred events - this is
+    what per-node map-view search (bmap.map_region) and the whole-catalog
+    diagnostics below use instead.
+
+    Args:
+        magnitudes (array-like): observed magnitudes
+        step (float): candidate spacing
+    Returns:
+        np.ndarray: candidate Mc values, or empty if `magnitudes` is empty
+    """
+    values = np.asarray(magnitudes, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return np.array([])
+    lo = np.floor(values.min() / step) * step
+    hi = np.ceil(values.max() / step) * step
+    return np.round(np.arange(lo, hi + step, step), 6)
+
+
+def ks_distance_curve(magnitudes, candidates=None, binsize=None, maxErr_b=0.25):
+    """
+    KS distance to a power law at every candidate Mc - the search behind
+    mc_ks(), exposed in full rather than collapsed to its winner. Compare
+    Goebel's `FMD.plotKS`: plotting `ks_distance` against `candidates` shows
+    not just which Mc mc_ks() picked but why - whether it sits in a clear,
+    stable minimum or won by a sliver among noisy neighbours, and which
+    candidates were disqualified by the sigma(b) guard (`qualifies`) before
+    ever being compared on KS distance.
+
+    Args:
+        magnitudes (array-like): observed magnitudes
+        candidates (array-like): Mc values to test; defaults to every unique
+            magnitude present (Goebel's default; pass ks_candidate_grid(...)
+            for anything bigger than a quick look)
+        binsize (float): magnitude bin width, for the Mc - dM/2 bin
+            correction; detected from the data when None
+        maxErr_b (float): a candidate qualifies when sigma(b) is below this
+    Returns:
+        dict: candidates, ks_distance (nan where undefined - fewer than 2
+            events at or above the candidate, or a non-positive Aki
+            denominator), sigma (nan under the same conditions), qualifies
+            (bool mask, sigma < maxErr_b), best_mc (nan if none qualify)
+    Source:
+        Clauset, Shalizi & Newman (2009), SIAM Review 51(4), 661-703
+    """
+    values = np.asarray(magnitudes, dtype=float)
+    values = values[np.isfinite(values)]
+    empty = {"candidates": np.array([]), "ks_distance": np.array([]),
+             "sigma": np.array([]), "qualifies": np.array([], dtype=bool),
+             "best_mc": np.nan}
+    if values.size == 0:
+        return empty
+    if binsize is None:
+        binsize = detect_binsize(values)
+    correction = binsize / 2.0
+    values = np.sort(values)
+
+    if candidates is None:
+        candidates = np.unique(values)
+    else:
+        candidates = np.unique(np.asarray(candidates, dtype=float))
+        candidates = candidates[candidates <= values[-1]]
+    if candidates.size == 0:
+        return empty
+
+    ks = np.full(candidates.shape, np.nan)
+    sigma_arr = np.full(candidates.shape, np.nan)
+    qualifies = np.zeros(candidates.shape, dtype=bool)
+    best_mc, best_ks = np.nan, np.inf
+    for i, mc in enumerate(candidates):
+        above = values[values >= mc]
+        n = above.size
+        if n < 2:
+            continue
+        mean_mag = above.mean()
+        denominator = mean_mag - (mc - correction)
+        if denominator <= 0:
+            continue
+        b = np.log10(np.e) / denominator
+        sigma = 2.30 * b**2 * np.sqrt(((above - mean_mag) ** 2).sum() / (n * (n - 1)))
+        sigma_arr[i] = sigma
+        ks[i] = _ks_distance_powerlaw(above, mc)
+        if sigma < maxErr_b:
+            qualifies[i] = True
+            if ks[i] < best_ks:
+                best_mc, best_ks = float(mc), ks[i]
+    return {"candidates": candidates, "ks_distance": ks, "sigma": sigma_arr,
+            "qualifies": qualifies, "best_mc": best_mc}
+
+
+def mc_ks(magnitudes, candidates=None, binsize=None, maxErr_b=0.25):
+    """
+    Magnitude of completeness by minimum Kolmogorov-Smirnov distance to a
+    power law (Clauset, Shalizi & Newman 2009), ported from Goebel's
+    `FMD.Mc_KS` / `FMD.KS_D_value_PL`.
+
+    For each candidate Mc, fit the events at or above it as a power law and
+    measure the largest gap between the observed and modelled cumulative
+    distributions. Candidates whose Shi & Bolt sigma(b) is at or above
+    `maxErr_b` are rejected first - without that guard the search drifts into
+    the sparse tail, where a handful of events can match the power-law shape
+    almost perfectly by accident and win on KS distance alone. Among what is
+    left, return the Mc with the smallest KS distance. (This is a thin
+    wrapper over ks_distance_curve() - call that directly to see the whole
+    search, e.g. to plot it the way Goebel's FMD.plotKS does.)
+
+    Unlike maximum curvature (just the bin holding the most events), this
+    looks at the whole magnitude range above each candidate, so a catalog
+    that is locally complete but still rolling off just above that bin does
+    not fool it the way it fools maximum curvature.
+
+    Args:
+        magnitudes (array-like): observed magnitudes
+        candidates (array-like): Mc values to test; defaults to the sorted
+            unique magnitudes present (Goebel's default - exhaustive, and
+            fine for a whole catalog, but pass a coarser grid for per-node
+            use in a map: hundreds of unique magnitudes per node is wasted
+            resolution, since Mc is never actually asserted finer than the
+            catalog's own binsize)
+        binsize (float): magnitude bin width, for the Mc - dM/2 bin
+            correction; detected from the data when None
+        maxErr_b (float): reject candidates with sigma(b) >= this
+    Returns:
+        float: Mc, or NaN if no candidate qualifies
+    Source:
+        Clauset, Shalizi & Newman (2009), SIAM Review 51(4), 661-703
+    """
+    return ks_distance_curve(magnitudes, candidates, binsize, maxErr_b)["best_mc"]
+
+
+def mc_vs_time(times, magnitudes, window=500, step=10, binsize=0.1,
+              method="maxcurv", ks_step=0.1, maxErr_b=0.25):
+    """
+    Completeness as a function of time, following Wiemer & Wyss (2000): a
+    sliding window of fixed event count, Mc re-estimated in each.
 
     Schorlemmer et al. use window=500, step=10 to justify the choice of a
-    single homogeneous Mc for the whole catalog.
+    single homogeneous Mc for the whole catalog - the same window/step run
+    under both methods is a check on that justification: if KS agrees Mc is
+    flat through time, maximum curvature having said so is not an artefact
+    of its own coarseness; if the two disagree about *where* Mc moves, that
+    is worth knowing before trusting either method's single regional value.
 
     Args:
         times (array-like): origin times, sorted or not
@@ -293,6 +460,12 @@ def mc_vs_time(times, magnitudes, window=500, step=10, binsize=0.1):
         window (int): events per window
         step (int): events to advance between windows
         binsize (float): magnitude bin width
+        method (str): 'maxcurv' or 'ks'
+        ks_step (float): candidate spacing for method='ks' (see
+            ks_candidate_grid) - built once from the whole series, not
+            per-window, both for speed and so windows are judged against a
+            consistent grid
+        maxErr_b (float): method='ks' only - see mc_ks
     Returns:
         tuple: (window centre times, Mc per window)
     """
@@ -302,12 +475,21 @@ def mc_vs_time(times, magnitudes, window=500, step=10, binsize=0.1):
     times, magnitudes = times[order], magnitudes[order]
     if times.size < window:
         return np.array([]), np.array([])
+    if method not in ("maxcurv", "ks"):
+        raise ValueError(f"method must be 'maxcurv' or 'ks', got {method!r}")
+
+    candidates = ks_candidate_grid(magnitudes, ks_step) if method == "ks" else None
 
     centres, values = [], []
     for start in range(0, times.size - window + 1, step):
         chunk = magnitudes[start:start + window]
         centres.append(times[start + window // 2])
-        values.append(mc_maxcurv(chunk, binsize))
+        if method == "maxcurv":
+            values.append(mc_maxcurv(chunk, binsize))
+        else:
+            local = candidates[candidates >= chunk.min()]
+            values.append(mc_ks(chunk, candidates=local, binsize=binsize,
+                                maxErr_b=maxErr_b))
     return np.asarray(centres), np.asarray(values)
 
 

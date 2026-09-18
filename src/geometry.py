@@ -135,6 +135,7 @@ class MapRegion:
         mid_lon = (self.bbox[2] + self.bbox[3]) / 2
         self.crs = local_crs(mid_lat, mid_lon)
         self._to_xy = Transformer.from_crs("EPSG:4326", self.crs, always_xy=True)
+        self._to_lonlat = Transformer.from_crs(self.crs, "EPSG:4326", always_xy=True)
         self._origin = np.array(self._to_xy.transform(mid_lon, mid_lat))
 
     def project(self, events):
@@ -142,6 +143,11 @@ class MapRegion:
         x, y = self._to_xy.transform(events["longitude"].values,
                                      events["latitude"].values)
         return events.assign(x=x - self._origin[0], y=y - self._origin[1])
+
+    def to_lonlat(self, x, y):
+        """Inverse of `project`: local km (east, north of centre) -> (lon, lat)."""
+        return self._to_lonlat.transform(np.asarray(x) + self._origin[0],
+                                         np.asarray(y) + self._origin[1])
 
     def select(self, events, depth_range=None):
         """Keep events inside the box (and optionally a depth range)."""

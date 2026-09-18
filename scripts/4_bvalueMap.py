@@ -11,21 +11,33 @@ regional b value, the highest M >= 6 probability sits in the *creeping* section
 onto the Middle Mountain asperity, where the 1966 Parkfield event nucleated and
 where the large events in the catalog actually are.
 
-Outputs into output/4_bvalueMap/:
-    <name>_bvalueMap.png     b, sigma(b) and N on the section
+Outputs into output/<study>/4_bvalueMap/ (CONFIG['study'] must match the
+study step 2 wrote the prepared catalog under):
+    <name>_bvalueMap.png     section view: b, sigma(b) and N on the section
     <name>_probability.png   annual P(M >= M0): constant b against varying b
     <name>_bvalueMap.json    the numbers, including where each peak falls
     <name>_bvalueMap.npz     the raw grids, for step 5
 
-Example
--------
-python scripts/4_bvalueMap.py --prepared parkfield --radius 5
+Map view instead writes <name>_bvalueMap.png as b, b-positive, sigma(b) and
+per-node Mc (the four panels needed to read and trust the map), plus - unless
+CONFIG['diagnostics_figure'] is False - a second, smaller
+<name>_bvalueMap_diagnostics.png with b-positive - b and N per node, the two
+supporting panels that are not needed every time but matter when the
+difference map is what actually shows a completeness artefact.
+
+No command-line flags: edit CONFIG below, then
+
+    python scripts/4_bvalueMap.py
+
+Example - what CONFIG should look like:
+    CONFIG["prepared"] = "parkfield"
+    CONFIG["radius"] = 5
 """
 
-import argparse
 import json
 import os
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -35,41 +47,50 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import matplotlib                                                  # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt                                    # noqa: E402
-from matplotlib.colors import LogNorm, Normalize                   # noqa: E402
+from matplotlib.colors import LogNorm, Normalize, TwoSlopeNorm                   # noqa: E402
 
 from src import bmap, bplot, geometry                              # noqa: E402
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-INPUT_DIR = os.path.join(PROJECT_DIR, "output", "2_prepare")
-OUTPUT_DIR = os.path.join(PROJECT_DIR, "output", "4_bvalueMap")
+# INPUT_DIR / OUTPUT_DIR are computed in main() from CONFIG['study']:
+# output/<study>/2_prepare, output/<study>/4_bvalueMap
+INPUT_DIR = OUTPUT_DIR = None
 
 PARKFIELD_FEATURES = {"Middle Mountain asperity": (70.0, 10.0),
                       "creeping section": (63.5, 3.0)}
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Step 4: map b at one radius, and the hazard that follows.",
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--prepared", required=True)
-    parser.add_argument("--radius", type=float, default=5.0,
-                        help="sampling radius in km (default 5, the paper's choice)")
-    parser.add_argument("--mc", type=float)
-    parser.add_argument("--nmin", type=int, default=50)
-    parser.add_argument("--spacing", type=float, default=0.5)
-    parser.add_argument("--depth", nargs=2, type=float, default=(0.0, 16.0),
-                        metavar=("MIN", "MAX"))
-    parser.add_argument("--m0", type=float, default=6.0,
-                        help="target magnitude for the probability map")
-    parser.add_argument("--big", type=float, default=4.5,
-                        help="overlay events at or above this magnitude")
-    parser.add_argument("--features", action="store_true",
-                        help="annotate the Parkfield landmarks")
-    return parser.parse_args()
+# Edit this, then just run the script - no command-line flags.
+CONFIG = {
+    # output/<study>/... - must match CONFIG['study'] used in step 2 for
+    # this prepared catalog.
+    "study": "elsalvador",
+
+    "prepared": 'elsalvador',          # required: basename in output/<study>/2_prepare, e.g. "parkfield"
+    "radius": 12.0,              # sampling radius, km (5 = the paper's choice)
+    "mc": 1.42,                 # completeness; None = whatever step 2 used
+    "nmin": 50,
+    "spacing": 0.5,
+    "depth": (0.0, 16.0),        # (min, max) km - section geometry only
+    "m0": 6.0,                   # target magnitude for the probability map (section only)
+    "big": 4.5,                  # overlay events at or above this magnitude (section only)
+    # map view only: 'fixed' (one Mc for the whole map), 'maxcurv' (per-node
+    # max curvature) or 'ks' (per-node min-KS-distance completeness)
+    "mc_method": "fixed",
+    "features": False,          # annotate the Parkfield landmarks (section view only)
+    "wells": False,              # overlay data/wells/well_data.csv (map view only;
+                                # a no-op anywhere outside Salton regardless)
+    "diagnostics_figure": True,  # also write the b+-b / N-events figure (map view only)
+}
 
 
 def main():
-    args = parse_args()
+    global INPUT_DIR, OUTPUT_DIR
+    args = SimpleNamespace(**CONFIG)
+    if not args.prepared:
+        raise SystemExit("error: set CONFIG['prepared'] at the top of this script.")
+    INPUT_DIR = os.path.join(PROJECT_DIR, "output", args.study, "2_prepare")
+    OUTPUT_DIR = os.path.join(PROJECT_DIR, "output", args.study, "4_bvalueMap")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     name = args.prepared
 
@@ -78,7 +99,7 @@ def main():
     with open(os.path.join(INPUT_DIR, f"{name}_prepare.json")) as handle:
         meta = json.load(handle)
     if meta.get("geometry") != "section":
-        raise SystemExit(f"error: {name} was prepared as '{meta.get('geometry')}'")
+        return run_map_view(name, events, meta, args)
 
     section = geometry.CrossSection(meta["p1"], meta["p2"], meta["width_km"])
     mc = args.mc if args.mc is not None else meta["mc_used"]
@@ -152,6 +173,220 @@ def main():
     print(f"\nwrote {os.path.relpath(maps_png, PROJECT_DIR)}")
     print(f"      {os.path.relpath(prob_png, PROJECT_DIR)}")
     return 0
+
+
+def run_map_view(name, events, meta, args):
+    """
+    Map-view b-value mapping, with the completeness diagnostic alongside.
+
+    Produces b and b-positive on the same scale (figure 1), and, unless
+    disabled, their difference alongside N per node (figure 2). The
+    difference matters even when its figure is off: b-positive is largely
+    insensitive to a moving detection threshold, so where it disagrees with
+    classic b the sample is incomplete rather than tectonically distinct -
+    the region-wide median difference is always printed below for that
+    reason, whether or not the map of it gets drawn.
+    """
+    region = geometry.MapRegion(meta["bbox"])
+    binsize = meta.get("magnitude_binsize") or None
+    mc = args.mc if args.mc is not None else meta["mc_used"]
+    # mc_method changes the map (see PLAN.md, Phase B: maxcurv and KS give
+    # materially different per-node Mc and coverage), so it goes in the output
+    # name - otherwise a second run under a different method silently
+    # overwrites the first, and re-running last year's command for the wrong
+    # method looks like it worked while quietly discarding a result.
+    out_name = f"{name}_{args.mc_method}"
+
+    print(f"{name}: {len(events):,} events, map view {region.bbox}")
+    print(f"  r = {args.radius} km, Mc = {mc} ({args.mc_method}), "
+          f"Nmin = {args.nmin}, nodes {args.spacing} km")
+
+    result = bmap.map_region(events, region, args.radius, mc=mc, nmin=args.nmin,
+                             binsize=binsize, spacing_km=args.spacing,
+                             mc_method=args.mc_method, positive=True)
+
+    print(f"\nresolved {result['n_resolved']:,} of {result['n_nodes']:,} nodes "
+          f"({result['coverage']*100:.1f}%)")
+    print(f"  b          {result['b_min']:.2f} .. {result['b_max']:.2f}  "
+          f"(median {result['b_median']:.3f})")
+    plus = result["b_positive"][np.isfinite(result["b_positive"])]
+    if plus.size:
+        print(f"  b-positive {plus.min():.2f} .. {plus.max():.2f}  "
+              f"(median {np.median(plus):.3f})")
+    print(f"  median (b+ - b)  {result['median_b_difference']:+.3f}")
+    node_mc = result["mc_node"][np.isfinite(result["mc_node"])]
+    if node_mc.size:
+        print(f"  per-node Mc  {node_mc.min():.2f} .. {node_mc.max():.2f}  "
+              f"(median {np.median(node_mc):.2f})")
+
+    gap = abs(result["median_b_difference"])
+    if gap > 0.05:
+        print(f"\n  ! b and b-positive differ by {gap:.3f} region-wide.\n"
+              "    That is a completeness signal, not a tectonic one: the\n"
+              "    classic estimator is biased low where the catalog is\n"
+              "    incomplete. Read the difference panel, and treat b-positive\n"
+              "    as the more trustworthy of the two maps.")
+
+    wells = load_wells() if args.wells else None
+    figures = plot_region_panels(out_name, result, region, wells, args)
+
+    np.savez_compressed(
+        os.path.join(OUTPUT_DIR, f"{out_name}_bvalueMap.npz"),
+        x=result["x"], y=result["y"], b=result["b"], sigma=result["sigma"],
+        a=result["a"], n=result["n"], mc_node=result["mc_node"],
+        b_positive=result["b_positive"], b_difference=result["b_difference"])
+    payload = {k: v for k, v in result.items() if not isinstance(v, np.ndarray)}
+    payload.update({"prepared": name, "mc_method": args.mc_method,
+                    "geometry": "map", "bbox": list(region.bbox)})
+    with open(os.path.join(OUTPUT_DIR, f"{out_name}_bvalueMap.json"), "w") as handle:
+        json.dump(payload, handle, indent=2, default=float)
+
+    print("\nwrote " + "\n      ".join(os.path.relpath(f, PROJECT_DIR) for f in figures))
+    return 0
+
+
+def load_wells():
+    """Geothermal well locations, if present, for overlay on the maps."""
+    path = os.path.join(PROJECT_DIR, "data", "wells", "well_data.csv")
+    if not os.path.exists(path):
+        return None
+    wells = pd.read_csv(path).dropna(subset=["Latitude", "Longitude"])
+    return wells if len(wells) else None
+
+
+def plot_region_panels(name, result, region, wells, args):
+    """
+    Figure 1 (always): b, b-positive, sigma(b), per-node Mc - the map, a
+    robustness check on it, and the two things that say how much to trust it
+    at any given node.
+
+    Figure 2 (args.diagnostics_figure): b-positive - b difference, and N per
+    node - supporting diagnostics, not needed to read the map every time, but
+    kept available since the difference panel is often where a completeness
+    artefact (as opposed to a real tectonic signal) actually shows up.
+
+    Returns the list of figure paths written (one or two).
+    """
+    written = [_plot_main_panels(name, result, region, wells, args)]
+    if args.diagnostics_figure:
+        written.append(_plot_diagnostic_panels(name, result, region, wells, args))
+    return written
+
+
+def _plot_main_panels(name, result, region, wells, args):
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12.5), sharex=True, sharey=True,
+                             constrained_layout=True)
+
+    # Centre the diverging scale on the median of the *mapped* values, not on
+    # the regional fit: where the catalog is incomplete the regional b is
+    # biased, and centring on it would paint almost the whole map "above
+    # average" for a reason that has nothing to do with the ground. The
+    # range itself is the 5th-95th percentile of b and b-positive combined
+    # (both share this scale) - not a fixed +-0.45 guess, which either
+    # saturates (real spread wider) or wastes most of the ramp (narrower).
+    centre = float(result["b_median"])
+    combined = np.concatenate([result["b"][np.isfinite(result["b"])],
+                               result["b_positive"][np.isfinite(result["b_positive"])]])
+    norm = bplot.bvalue_norm(centre, values=combined)
+    cmap = bplot.bvalue_cmap()
+
+    mesh = bplot.draw_region_map(axes[0, 0], result, norm, cmap, key="b",
+                                 show_xlabel=False)
+    axes[0, 0].set_title(f"(a)  classic b   median {centre:.3f}",
+                         fontsize=11, loc="left")
+
+    plus_median = float(np.nanmedian(result["b_positive"]))
+    bplot.draw_region_map(axes[0, 1], result, norm, cmap, key="b_positive",
+                          show_xlabel=False, show_ylabel=False)
+    axes[0, 1].set_title(f"(b)  b-positive   median {plus_median:.3f}",
+                         fontsize=11, loc="left")
+    bar = fig.colorbar(mesh, ax=axes[0, :].tolist(), fraction=.030, pad=.008,
+                       extend="both")
+    bar.set_label(f"b-value   (rule = mapped median {centre:.2f})", fontsize=9)
+    bar.ax.axhline(centre, color="#1a1a1a", lw=1.4)
+
+    sigma = np.ma.masked_invalid(result["sigma"])
+    mesh = axes[1, 0].pcolormesh(result["x"], result["y"], sigma,
+                                 cmap=bplot.sequential_cmap("sigma"),
+                                 shading="nearest", rasterized=True)
+    axes[1, 0].set_aspect("equal")
+    finite_sigma = result["sigma"][np.isfinite(result["sigma"])]
+    axes[1, 0].set_title(f"(c)  $\\sigma(b)$   median "
+                         f"{np.median(finite_sigma):.3f}" if finite_sigma.size
+                         else "(c)  $\\sigma(b)$", fontsize=11, loc="left")
+    bar = fig.colorbar(mesh, ax=axes[1, 0], fraction=.046, pad=.008)
+    bar.set_label("$\\sigma(b)$", fontsize=9)
+
+    node_mc = np.ma.masked_invalid(result["mc_node"])
+    mesh = axes[1, 1].pcolormesh(result["x"], result["y"], node_mc,
+                                 cmap=bplot.sequential_cmap("probability"),
+                                 shading="nearest", rasterized=True)
+    axes[1, 1].set_aspect("equal")
+    axes[1, 1].set_title(f"(d)  magnitude of completeness per node "
+                         f"({args.mc_method})", fontsize=11, loc="left")
+    bar = fig.colorbar(mesh, ax=axes[1, 1], fraction=.046, pad=.008)
+    bar.set_label("$M_c$", fontsize=9)
+
+    any_wells = False
+    for index, ax in enumerate(axes.ravel()):
+        any_wells = bplot.overlay_wells(ax, region, wells) or any_wells
+        bplot.set_lonlat_ticks(ax, region)
+        if index >= 2:
+            ax.set_xlabel("longitude")
+        if index % 2 == 0:
+            ax.set_ylabel("latitude")
+    if any_wells:
+        axes[0, 0].legend(loc="upper right", fontsize=8.5, framealpha=.92)
+
+    fig.suptitle(f"{name}: b-value in map view   r = {args.radius:.0f} km, "
+                 f"Nmin = {args.nmin}, nodes {args.spacing} km   "
+                 f"({result['coverage']*100:.0f}% resolved)", fontsize=13)
+    path = os.path.join(OUTPUT_DIR, f"{name}_bvalueMap.png")
+    fig.savefig(path, dpi=145, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def _plot_diagnostic_panels(name, result, region, wells, args):
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5), sharex=True, sharey=True,
+                             constrained_layout=True)
+
+    difference = np.ma.masked_invalid(result["b_difference"])
+    reach = float(np.nanpercentile(np.abs(result["b_difference"]), 98)) or 0.1
+    mesh = axes[0].pcolormesh(result["x"], result["y"], difference,
+                              cmap=bplot.delta_cmap(),
+                              norm=TwoSlopeNorm(vcenter=0, vmin=-reach, vmax=reach),
+                              shading="nearest", rasterized=True)
+    axes[0].set_aspect("equal")
+    axes[0].set_title(f"(a)  b-positive $-$ b   median "
+                      f"{result['median_b_difference']:+.3f}  "
+                      f"(large = incomplete, not tectonic)",
+                      fontsize=11, loc="left")
+    bar = fig.colorbar(mesh, ax=axes[0], fraction=.046, pad=.008, extend="both")
+    bar.set_label("$b^+ - b$", fontsize=9)
+
+    counts = np.ma.masked_where(result["n"] == 0, result["n"])
+    mesh = axes[1].pcolormesh(result["x"], result["y"], counts,
+                              cmap=bplot.sequential_cmap("count"),
+                              shading="nearest", rasterized=True)
+    axes[1].set_aspect("equal")
+    axes[1].set_title(f"(b)  N events above $M_c$   Nmin = {args.nmin}",
+                      fontsize=11, loc="left")
+    bar = fig.colorbar(mesh, ax=axes[1], fraction=.046, pad=.008)
+    bar.set_label("N", fontsize=9)
+
+    for ax in axes:
+        bplot.overlay_wells(ax, region, wells)
+        bplot.set_lonlat_ticks(ax, region)
+        ax.set_xlabel("longitude")
+    axes[0].set_ylabel("latitude")
+
+    fig.suptitle(f"{name}: b-value diagnostics   r = {args.radius:.0f} km, "
+                 f"Nmin = {args.nmin}, nodes {args.spacing} km", fontsize=13)
+    path = os.path.join(OUTPUT_DIR, f"{name}_bvalueMap_diagnostics.png")
+    fig.savefig(path, dpi=145, bbox_inches="tight")
+    plt.close(fig)
+    return path
 
 
 def plot_maps(name, result, events, big, regional_b, args):

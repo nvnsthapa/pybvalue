@@ -11,20 +11,25 @@ Larger radii cover more nodes but smooth anomalies away, so the scan reports
 both coverage and contrast at each radius and the choice is made on the two
 together.
 
-Outputs into output/3_radiusScan/:
+Outputs into output/<study>/3_radiusScan/ (CONFIG['study'] must match the
+study step 2 wrote the prepared catalog under):
     <name>_radiusScan.png      one panel per radius, shared colour scale
     <name>_radiusTradeoff.png  coverage against contrast
     <name>_radiusScan.json     the numbers behind both figures
 
-Example
--------
-python scripts/3_radiusScan.py --prepared parkfield --mc 1.3
+No command-line flags: edit CONFIG below, then
+
+    python scripts/3_radiusScan.py
+
+Example - what CONFIG should look like:
+    CONFIG["prepared"] = "parkfield"
+    CONFIG["mc"] = 1.3
 """
 
-import argparse
 import json
 import os
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -38,8 +43,9 @@ import matplotlib.pyplot as plt                                    # noqa: E402
 from src import bmap, bplot, fmd, geometry                         # noqa: E402
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-INPUT_DIR = os.path.join(PROJECT_DIR, "output", "2_prepare")
-OUTPUT_DIR = os.path.join(PROJECT_DIR, "output", "3_radiusScan")
+# INPUT_DIR / OUTPUT_DIR are computed in main() from CONFIG['study']:
+# output/<study>/2_prepare, output/<study>/3_radiusScan
+INPUT_DIR = OUTPUT_DIR = None
 
 # The radii of the paper's Figure 4.
 DEFAULT_RADII = (2, 3, 4, 5, 6, 7, 8, 10, 20)
@@ -49,28 +55,32 @@ PARKFIELD_FEATURES = {"Middle Mountain asperity": (70.0, 10.0),
                       "creeping section": (63.5, 3.0)}
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Step 3: map b over a range of radii and pick one.",
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--prepared", required=True,
-                        help="basename in output/2_prepare (e.g. parkfield)")
-    parser.add_argument("--radii", nargs="+", type=float, default=list(DEFAULT_RADII))
-    parser.add_argument("--mc", type=float,
-                        help="completeness (default: whatever step 2 used)")
-    parser.add_argument("--nmin", type=int, default=50,
-                        help="minimum events above Mc per node (default 50)")
-    parser.add_argument("--spacing", type=float, default=0.5,
-                        help="node spacing, km (default 0.5)")
-    parser.add_argument("--depth", nargs=2, type=float, default=(0.0, 16.0),
-                        metavar=("MIN", "MAX"))
-    parser.add_argument("--features", action="store_true",
-                        help="annotate the Parkfield landmarks")
-    return parser.parse_args()
+# Edit this, then just run the script - no command-line flags.
+CONFIG = {
+    # output/<study>/... - must match CONFIG['study'] used in step 2 for
+    # this prepared catalog.
+    "study": "elsalvador",
+
+    "prepared": 'elsalvador',          # required: basename in output/<study>/2_prepare, e.g. "parkfield"
+    "radii": sorted(set(DEFAULT_RADII) | {12, 15}),   # filling the r=10..20 gap
+    "mc": 1.42,                 # completeness; None = whatever step 2 used
+    "nmin": 50,                 # minimum events above Mc per node
+    "spacing": 0.5,              # node spacing, km
+    "depth": (0.0, 16.0),        # (min, max) km - section geometry only
+    # map view only: 'fixed' (one Mc for the whole map), 'maxcurv' (per-node
+    # max curvature) or 'ks' (per-node min-KS-distance completeness)
+    "mc_method": "fixed",
+    "features": False,          # annotate the Parkfield landmarks
+}
 
 
 def main():
-    args = parse_args()
+    global INPUT_DIR, OUTPUT_DIR
+    args = SimpleNamespace(**CONFIG)
+    if not args.prepared:
+        raise SystemExit("error: set CONFIG['prepared'] at the top of this script.")
+    INPUT_DIR = os.path.join(PROJECT_DIR, "output", args.study, "2_prepare")
+    OUTPUT_DIR = os.path.join(PROJECT_DIR, "output", args.study, "3_radiusScan")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     name = args.prepared
 
@@ -82,30 +92,49 @@ def main():
     events = pd.read_csv(catalog_path, parse_dates=["time"])
     with open(meta_path) as handle:
         meta = json.load(handle)
-    if meta.get("geometry") != "section":
-        raise SystemExit("error: this step maps cross sections; "
-                         f"{name} was prepared as '{meta.get('geometry')}'")
-
-    section = geometry.CrossSection(meta["p1"], meta["p2"], meta["width_km"])
+    is_section = meta.get("geometry") == "section"
+    if is_section:
+        section = geometry.CrossSection(meta["p1"], meta["p2"], meta["width_km"])
+    else:
+        section = geometry.MapRegion(meta["bbox"])
     mc = args.mc if args.mc is not None else meta["mc_used"]
     binsize = meta.get("magnitude_binsize") or None
     regional = meta.get("regional_fit", {})
     centre = regional.get("b") or 1.0
+    # mc_method changes the map in map view (maxcurv vs KS give materially
+    # different per-node Mc, coverage and contrast - see PLAN.md, Phase B), so
+    # it goes in the output name. A section always uses a single fixed Mc, so
+    # its name is untouched. Without this, scanning a second method for the
+    # same CONFIG['prepared'] name silently overwrites the first method's
+    # figures.
+    output_name = name if is_section else f"{name}_{args.mc_method}"
 
-    print(f"{name}: {len(events):,} events on a {section.length_km:.1f} km section")
-    print(f"  Mc={mc}  Nmin={args.nmin}  spacing={args.spacing} km  "
-          f"depth {args.depth[0]}..{args.depth[1]} km")
+    if is_section:
+        print(f"{name}: {len(events):,} events on a "
+              f"{section.length_km:.1f} km section")
+        print(f"  depth {args.depth[0]}..{args.depth[1]} km")
+    else:
+        print(f"{name}: {len(events):,} events in map view {section.bbox}")
+    print(f"  Mc={mc}  Nmin={args.nmin}  spacing={args.spacing} km")
     print(f"  regional b = {centre:.3f} (colour scale centres here)\n")
 
-    results = bmap.radius_scan(events, section, args.radii, mc, nmin=args.nmin,
-                               binsize=binsize, spacing_km=args.spacing,
-                               depth_range=tuple(args.depth))
+    if is_section:
+        results = bmap.radius_scan(events, section, args.radii, mc, nmin=args.nmin,
+                                   binsize=binsize, spacing_km=args.spacing,
+                                   depth_range=tuple(args.depth))
+    else:
+        print(f"map view, {args.spacing} km nodes, Mc method '{args.mc_method}'")
+        results = [bmap.map_region(events, section, radius, mc=mc, nmin=args.nmin,
+                                   binsize=binsize, spacing_km=args.spacing,
+                                   mc_method=args.mc_method, positive=False,
+                                   verbose=True)
+                   for radius in args.radii]
 
     # ---- pick a radius ----------------------------------------------------
     usable = [r for r in results if r["n_resolved"] > 0]
     if not usable:
-        raise SystemExit("error: no radius resolved any node; lower --nmin "
-                         "or check Mc")
+        raise SystemExit("error: no radius resolved any node; lower "
+                         "CONFIG['nmin'] or check Mc")
     similarity = pattern_similarity(results)
     for result, value in zip(results, similarity):
         result["similarity_to_finest"] = value
@@ -118,27 +147,29 @@ def main():
               f"{result['b_contrast']:>9.3f} {value:>15.3f}{mark}")
     print(f"\nsuggested radius: {best['radius_km']:.0f} km "
           f"(coverage {best['coverage']*100:.0f}%, contrast {best['b_contrast']:.3f})")
-    print("  the paper chose 5 km for Parkfield, calling 4-5 km optimal.")
+    if name == "parkfield":
+        print("  the paper chose 5 km for Parkfield, calling 4-5 km optimal.")
     print("  Similarity decays smoothly with no sharp break, so no automatic")
     print("  rule recovers that exactly - read the panels before committing.")
 
     # ---- figures ----------------------------------------------------------
-    scan_png = plot_scan(name, results, centre, section, args)
-    trade_png = plot_tradeoff(name, usable, best)
+    scan_png = plot_scan(output_name, results, centre, section, args)
+    trade_png = plot_tradeoff(output_name, usable, best)
 
     payload = {
-        "prepared": name, "mc": mc, "nmin": args.nmin,
+        "prepared": name, "mc_method": args.mc_method, "mc": mc, "nmin": args.nmin,
         "spacing_km": args.spacing, "depth_range": list(args.depth),
         "regional_b": centre, "suggested_radius_km": best["radius_km"],
         "radii": [{k: v for k, v in r.items()
                    if not isinstance(v, np.ndarray)} for r in results],
     }
-    with open(os.path.join(OUTPUT_DIR, f"{name}_radiusScan.json"), "w") as handle:
+    json_path = os.path.join(OUTPUT_DIR, f"{output_name}_radiusScan.json")
+    with open(json_path, "w") as handle:
         json.dump(payload, handle, indent=2, default=float)
 
     print(f"\nwrote {os.path.relpath(scan_png, PROJECT_DIR)}")
     print(f"      {os.path.relpath(trade_png, PROJECT_DIR)}")
-    print(f"      {os.path.relpath(os.path.join(OUTPUT_DIR, name + '_radiusScan.json'), PROJECT_DIR)}")
+    print(f"      {os.path.relpath(json_path, PROJECT_DIR)}")
     return 0
 
 
@@ -192,7 +223,10 @@ def plot_scan(name, results, centre, section, args):
     """Small multiples: one panel per radius, one shared colour scale."""
     columns = 3
     rows = int(np.ceil(len(results) / columns))
-    fig, axes = plt.subplots(rows, columns, figsize=(5.4 * columns, 2.5 * rows),
+    tall = "depth" not in results[0]
+    fig, axes = plt.subplots(rows, columns,
+                             figsize=(5.4 * columns,
+                                      (4.6 if tall else 2.5) * rows),
                              sharex=True, sharey=True, constrained_layout=True)
     axes = np.atleast_1d(axes).ravel()
     norm = bplot.bvalue_norm(centre)
@@ -200,13 +234,16 @@ def plot_scan(name, results, centre, section, args):
     mesh = None
 
     for index, (ax, result) in enumerate(zip(axes, results)):
-        mesh = bplot.draw_section_map(
-            ax, result, norm, cmap,
-            show_xlabel=index >= len(results) - columns,
-            show_ylabel=index % columns == 0)
+        label_kw = dict(show_xlabel=index >= len(results) - columns,
+                        show_ylabel=index % columns == 0)
+        if "depth" in result:
+            mesh = bplot.draw_section_map(ax, result, norm, cmap, **label_kw)
+        else:
+            mesh = bplot.draw_region_map(ax, result, norm, cmap, region=section,
+                                         **label_kw)
         bplot.annotate_panel(ax, f"({chr(97+index)})  r = {result['radius_km']:.0f} km",
                              coverage=result["coverage"])
-        if args.features:
+        if args.features and "depth" in result:
             bplot.mark_features(ax, PARKFIELD_FEATURES)
 
     for ax in axes[len(results):]:
@@ -282,8 +319,8 @@ def plot_tradeoff(name, results, best):
     three.set_title("the trade-off itself", fontsize=11)
     three.grid(alpha=.3)
 
-    fig.suptitle(f"{name}: choosing the sampling radius   "
-                 f"(the paper chose 5 km at Parkfield)", fontsize=12)
+    aside = "   (the paper chose 5 km at Parkfield)" if name == "parkfield" else ""
+    fig.suptitle(f"{name}: choosing the sampling radius{aside}", fontsize=12)
     fig.tight_layout()
     path = os.path.join(OUTPUT_DIR, f"{name}_radiusTradeoff.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")

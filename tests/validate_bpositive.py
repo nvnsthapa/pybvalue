@@ -33,7 +33,8 @@ import matplotlib.pyplot as plt                                    # noqa: E402
 from src import fmd                                                # noqa: E402
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUTPUT_DIR = os.path.join(PROJECT_DIR, "output", "validation")
+STUDY = "parkfield_salton"   # grouping folder only - this test is synthetic, not region-specific
+OUTPUT_DIR = os.path.join(PROJECT_DIR, "output", STUDY, "validation")
 
 TRUE_B = 1.0
 BINSIZE = 0.1

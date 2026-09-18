@@ -14,22 +14,26 @@ Significance follows the paper:
     dAIC < 2  not significant       dAIC > 2  significant (Pb <= 0.05)
                                     dAIC > 5  highly significant (Pb <= 0.01)
 
-Outputs into output/5_stationarity/:
+Outputs into output/<study>/5_stationarity/ (CONFIG['study'] must match the
+study step 2 wrote the prepared catalog under):
     <name>_stationarity_<split>.png   six panels: b1, b2, db, s1, s2, log Pb
     <name>_stationarity_<split>.json  counts and the largest changes
     <name>_divisionScan.png           significance against where the split falls
 
-Examples
---------
-python scripts/5_stationarity.py --prepared parkfield --split 1992-01-01
-python scripts/5_stationarity.py --prepared parkfield --split 1996-01-01
-python scripts/5_stationarity.py --prepared parkfield --scan
+No command-line flags: edit CONFIG below, then
+
+    python scripts/5_stationarity.py
+
+Examples - what CONFIG should look like:
+    CONFIG["prepared"] = "parkfield"; CONFIG["split"] = "1992-01-01"
+    CONFIG["prepared"] = "parkfield"; CONFIG["split"] = "1996-01-01"
+    CONFIG["prepared"] = "parkfield"; CONFIG["scan"] = True
 """
 
-import argparse
 import json
 import os
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -44,31 +48,31 @@ from matplotlib.colors import Normalize, TwoSlopeNorm              # noqa: E402
 from src import bmap, bplot, fmd, geometry                              # noqa: E402
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-INPUT_DIR = os.path.join(PROJECT_DIR, "output", "2_prepare")
-OUTPUT_DIR = os.path.join(PROJECT_DIR, "output", "5_stationarity")
+# INPUT_DIR / OUTPUT_DIR are computed in main() from CONFIG['study']:
+# output/<study>/2_prepare, output/<study>/5_stationarity
+INPUT_DIR = OUTPUT_DIR = None
 
 PARKFIELD_FEATURES = {"Middle Mountain asperity": (70.0, 10.0)}
 
 SIGNIFICANT, HIGHLY_SIGNIFICANT = 2.0, 5.0     # thresholds on dAIC
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Step 5: test whether the b-value pattern is stationary.",
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--prepared", required=True)
-    parser.add_argument("--split", default="1992-01-01",
-                        help="date dividing the two periods (default 1992-01-01)")
-    parser.add_argument("--radius", type=float, default=5.0)
-    parser.add_argument("--mc", type=float)
-    parser.add_argument("--nmin", type=int, default=50)
-    parser.add_argument("--spacing", type=float, default=0.5)
-    parser.add_argument("--depth", nargs=2, type=float, default=(0.0, 16.0),
-                        metavar=("MIN", "MAX"))
-    parser.add_argument("--scan", action="store_true",
-                        help="also sweep the division date year by year")
-    parser.add_argument("--features", action="store_true")
-    return parser.parse_args()
+# Edit this, then just run the script - no command-line flags.
+CONFIG = {
+    # output/<study>/... - must match CONFIG['study'] used in step 2 for
+    # this prepared catalog.
+    "study": "parkfield_salton",
+
+    "prepared": 'parkfield',          # required: basename in output/<study>/2_prepare, e.g. "parkfield"
+    "split": '1992-01-01',      # date dividing the two periods
+    "radius": 5.0,
+    "mc": 1.6,                 # completeness; None = whatever step 2 used
+    "nmin": 50,
+    "spacing": 0.5,
+    "depth": (0.0, 16.0),        # (min, max) km
+    "scan": False,               # also sweep the division date year by year
+    "features": False,          # annotate the Parkfield landmarks
+}
 
 
 def load(name):
@@ -98,7 +102,12 @@ def split_and_compare(events, section, split, args, mc, binsize):
 
 
 def main():
-    args = parse_args()
+    global INPUT_DIR, OUTPUT_DIR
+    args = SimpleNamespace(**CONFIG)
+    if not args.prepared:
+        raise SystemExit("error: set CONFIG['prepared'] at the top of this script.")
+    INPUT_DIR = os.path.join(PROJECT_DIR, "output", args.study, "2_prepare")
+    OUTPUT_DIR = os.path.join(PROJECT_DIR, "output", args.study, "5_stationarity")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     name = args.prepared
 
@@ -140,6 +149,8 @@ def main():
     print(f"  highly significant    {highly:,}   dAIC > 5")
     print("  paper (split 1992):   34 of 2,950  (<1.2%)")
 
+    correction = significance_report(comparison, events, section, args, mc, binsize)
+
     delta = comparison["delta_b"]
     finite = np.isfinite(delta)
     if finite.any():
@@ -163,6 +174,7 @@ def main():
         "n_compared": compared, "n_significant": significant,
         "n_highly_significant": highly, "percent_significant": share,
         "completeness_check": drift,
+        "significance_correction": correction,
         "largest_changes": hotspots,
     }
     with open(os.path.join(OUTPUT_DIR, f"{name}_stationarity_{label}.json"),
@@ -215,11 +227,86 @@ def completeness_check(early, late, mc, binsize, comparison):
               "does.\n"
               "    The Utsu test cannot separate that from local change, so these\n"
               "    counts are inflated by a completeness difference between the\n"
-              "    periods rather than by tectonics. Re-run with a higher --mc\n"
+              "    periods rather than by tectonics. Re-run with a higher CONFIG['mc']\n"
               "    and see whether the shift, and the counts, go away.")
     return {"b_period1": first["b"], "b_period2": second["b"],
             "regional_shift": shift, "median_node_change": typical,
             "shift_dominates": dominated}
+
+
+def significance_report(comparison, events, section, args, mc, binsize):
+    """
+    Correct the dense grid's significance count for multiple testing
+    (Marzocchi, Zechar & Jordan 2020, doi:10.1093/gji/ggz541 - see PLAN.md
+    Phase D).
+
+    The raw "dAIC > 2 at N nodes" count from `compare_maps` treats every node
+    as an independent, pre-specified test. Neither is true on a dense grid:
+    at 0.5 km spacing and r = 5 km, a node's sample overlaps its neighbours'
+    almost completely, and the count includes every node the grid happens to
+    have, not one decided on in advance. This reports three corrections for
+    that, from roughest to most defensible:
+
+      1. an *estimated* effective sample count, from tiling the section with
+         non-overlapping spans instead of the dense grid;
+      2. Bonferroni and Benjamini-Hochberg correction of the dense grid's own
+         p-values (Pb), which is cheap but still tests the same, non-independent
+         nodes;
+      3. **the actual re-run** on a non-overlapping grid (spacing = 2r, so
+         adjacent samples cannot share an event) - this is the only one of the
+         three that is not an approximation, and is the number to quote for a
+         headline claim.
+
+    Args:
+        comparison (dict): output of bmap.compare_maps, on the dense grid
+        events (pd.DataFrame): the full prepared catalog (for the re-run)
+        section (geometry.CrossSection)
+        args: run configuration (needs radius, split, nmin, depth, mc_method
+            is not used here - section geometry only)
+        mc (float), binsize (float)
+    Returns:
+        dict: n_effective_estimate, bonferroni, benjamini_hochberg (each a
+              summary dict), and independent_grid (the non-overlapping re-run)
+    """
+    p_b = comparison["p_b"]
+    n_eff = bmap.effective_samples(args.radius, length_km=section.length_km)
+    bonf = bmap.bonferroni(p_b)
+    fdr = bmap.benjamini_hochberg(p_b)
+
+    print(f"\n  --- multiple-testing correction (Phase D) ---")
+    print(f"  effective independent samples (estimate)   ~{n_eff}   "
+          f"(section {section.length_km:.0f} km / 2r={2*args.radius:.0f} km)")
+    print(f"  Bonferroni   (alpha=0.05 / {bonf['n_tested']:,} tests)   "
+          f"{bonf['n_significant']:,} significant   "
+          f"(threshold Pb <= {bonf['threshold_p']:.2e})")
+    print(f"  Benjamini-Hochberg FDR (alpha=0.05)         "
+          f"{fdr['n_significant']:,} significant   "
+          + (f"(threshold Pb <= {fdr['threshold_p']:.2e})"
+             if np.isfinite(fdr["threshold_p"]) else "(none passed)"))
+
+    # The one that is not an approximation: actually re-sample so neighbouring
+    # nodes cannot share an event.
+    independent_args = SimpleNamespace(**{**vars(args), "spacing": 2 * args.radius})
+    outcome = split_and_compare(events, section, args.split, independent_args,
+                                mc, binsize)
+    if outcome is None:
+        independent = {"n_compared": 0, "n_significant": 0}
+        print("  non-overlapping grid (spacing = 2r)         "
+              "too few events either side of the split")
+    else:
+        _, _, _, _, independent_comparison = outcome
+        independent = {"n_compared": independent_comparison["n_compared"],
+                       "n_significant": independent_comparison["n_significant"]}
+        share = (100 * independent["n_significant"] / independent["n_compared"]
+                if independent["n_compared"] else float("nan"))
+        print(f"  non-overlapping grid (spacing = 2r)         "
+              f"{independent['n_significant']} of {independent['n_compared']} "
+              f"significant  ({share:.1f}%)  <- the defensible headline number")
+
+    return {"n_effective_estimate": n_eff,
+            "bonferroni": {k: v for k, v in bonf.items() if k != "reject"},
+            "benjamini_hochberg": {k: v for k, v in fdr.items() if k != "reject"},
+            "independent_grid": independent}
 
 
 def largest_changes(first, comparison, limit=4, separation_km=8.0):
@@ -339,10 +426,21 @@ def run_scan(name, events, section, args, mc, binsize):
 
     A pattern that is genuinely stationary stays stationary wherever the split
     is placed; a spike at one particular date is the interesting case.
+
+    This is exploratory, and Marzocchi et al. (2020)'s look-elsewhere warning
+    applies to it directly: scanning N split dates and reporting the most
+    significant one is itself an uncorrected multiple-testing problem, on top
+    of the per-node one `significance_report` corrects. Do not read "the scan
+    peaks at year Y" as a tested claim - it is a hypothesis the scan
+    generates. The tested claim is the single, pre-specified `args.split`
+    that `main()` already ran through `significance_report` before this
+    function is even called.
     """
     start, end = events["time"].min(), events["time"].max()
     years = range(start.year + 3, end.year - 2)
     print(f"\nscanning division dates {start.year + 3}..{end.year - 3}")
+    print("  (exploratory - the tested claim is the pre-specified split above,")
+    print("   not whichever year here scores highest; see Phase D in PLAN.md)")
 
     rows = []
     for year in years:

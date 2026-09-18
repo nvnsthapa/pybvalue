@@ -106,6 +106,147 @@ def map_section(events, section, radius_km, mc, nmin=50, binsize=None,
     return result
 
 
+def map_region(events, region, radius_km, mc=None, nmin=50, binsize=None,
+               spacing_km=1.0, mc_method="fixed", positive=True,
+               ks_step=0.1, ks_max_err=0.25, verbose=False):
+    """
+    Map b in map view: vertical cylinders of radius r about each grid node.
+
+    Differs from `map_section` in three ways that matter for a basin rather
+    than a single fault strand:
+
+      * sampling is epicentral, in a locally projected km frame;
+      * Mc can be estimated **per node** instead of assumed constant, because
+        network density varies across a region like the Salton Trough far more
+        than it does along one fault;
+      * b-positive is computed alongside the classic estimator, so the two can
+        be differenced into a map of where completeness is suspect.
+
+    Args:
+        events (pd.DataFrame): needs `latitude`, `longitude`, `magnitude`,
+            `time`. Sorted by time internally - b-positive requires it.
+        region (geometry.MapRegion): the area being mapped
+        radius_km (float): sampling radius
+        mc (float): completeness when `mc_method` is 'fixed'; also the floor
+            below which a per-node estimate is not allowed to fall
+        nmin (int): minimum events above Mc for a node to be computed
+        binsize (float): magnitude bin width; detected when None
+        spacing_km (float): node spacing. 0.5 km over a whole basin is a very
+            large grid; 1 km is a saner default here than at Parkfield
+        mc_method (str): 'fixed', 'maxcurv' (per-node maximum curvature) or
+            'ks' (per-node minimum-KS-distance completeness, Clauset et al.
+            2009 / Goebel's FMD.Mc_KS - looks at the whole magnitude range
+            above each candidate rather than just the modal bin, so it is
+            less easily fooled by a catalog that is locally complete but
+            still rolling off just above its mode)
+        positive (bool): also compute b-positive at every node
+        ks_step (float): candidate spacing for mc_method='ks'. Mc is never
+            asserted finer than this - searching every unique magnitude per
+            node (Goebel's whole-catalog default) is both wasted resolution
+            and, over tens of thousands of nodes, far too slow
+        ks_max_err (float): mc_method='ks' rejects candidates with Shi & Bolt
+            sigma(b) at or above this, to keep the search out of the tail
+        verbose (bool): print a one-line summary
+    Returns:
+        dict: x, y (1-D node axes, km); grid_x, grid_y; b, sigma, a, n, mc_node
+              (2-D, NaN where unresolved); b_positive, sigma_positive,
+              n_positive when `positive`; plus the usual metadata and coverage
+    """
+    frame = events.sort_values("time")
+    magnitudes = frame["magnitude"].to_numpy(dtype=float)
+    if binsize is None:
+        binsize = fmd.detect_binsize(magnitudes)
+
+    projected = region.project(frame)
+    coords = np.column_stack([projected["x"].to_numpy(), projected["y"].to_numpy()])
+    x_axis, y_axis, grid_x, grid_y = region.node_grid(spacing_km=spacing_km)
+    shape = grid_x.shape
+
+    tree = cKDTree(coords)
+    nodes = np.column_stack([grid_x.ravel(), grid_y.ravel()])
+    neighbours = tree.query_ball_point(nodes, r=radius_km, workers=-1)
+
+    fields = {name: np.full(shape, np.nan).ravel()
+              for name in ("b", "sigma", "a", "mc_node", "b_positive",
+                           "sigma_positive")}
+    counts = np.zeros(shape, dtype=int).ravel()
+    counts_positive = np.zeros(shape, dtype=int).ravel()
+    floor = mc if mc is not None else -np.inf
+
+    ks_candidates = fmd.ks_candidate_grid(magnitudes, ks_step) if mc_method == "ks" else None
+
+    for i, index in enumerate(neighbours):
+        if len(index) < nmin:
+            continue
+        # Events were sorted by time before the tree was built, so sorting the
+        # neighbour indices restores time order - which b-positive requires and
+        # query_ball_point does not preserve.
+        index = np.sort(np.asarray(index))
+        sample = magnitudes[index]
+
+        if mc_method == "maxcurv":
+            node_mc = fmd.mc_maxcurv(sample, binsize or 0.1)
+            if not np.isfinite(node_mc):
+                continue
+            node_mc = max(node_mc, floor) if np.isfinite(floor) else node_mc
+        elif mc_method == "ks":
+            local_candidates = ks_candidates[ks_candidates >= sample.min()]
+            node_mc = fmd.mc_ks(sample, candidates=local_candidates,
+                                binsize=binsize, maxErr_b=ks_max_err)
+            if not np.isfinite(node_mc):
+                continue
+            node_mc = max(node_mc, floor) if np.isfinite(floor) else node_mc
+        else:
+            node_mc = mc
+        fields["mc_node"][i] = node_mc
+
+        classic = fmd.fit_gr(sample, node_mc, binsize=binsize, min_events=nmin)
+        counts[i] = classic["n"]
+        if classic["n"] < nmin or not np.isfinite(classic["b"]):
+            continue
+        fields["b"][i] = classic["b"]
+        fields["sigma"][i] = classic["sigma"]
+        fields["a"][i] = classic["a"]
+
+        if positive:
+            plus = fmd.fit_gr_positive(sample, binsize=binsize, mc=node_mc)
+            if np.isfinite(plus["b"]) and plus["n"] >= max(2, nmin // 4):
+                fields["b_positive"][i] = plus["b"]
+                fields["sigma_positive"][i] = plus["sigma"]
+                counts_positive[i] = plus["n"]
+
+    result = {"x": x_axis, "y": y_axis, "grid_x": grid_x, "grid_y": grid_y,
+              "n": counts.reshape(shape), "n_positive": counts_positive.reshape(shape),
+              "radius_km": float(radius_km), "mc": mc, "mc_method": mc_method,
+              "nmin": int(nmin), "binsize": float(binsize),
+              "spacing_km": float(spacing_km), "n_nodes": int(counts.size)}
+    result.update({name: field.reshape(shape) for name, field in fields.items()})
+
+    resolved = np.isfinite(result["b"])
+    result["n_resolved"] = int(resolved.sum())
+    result["coverage"] = float(resolved.mean())
+    result.update(heterogeneity(result["b"]))
+
+    both = resolved & np.isfinite(result["b_positive"])
+    difference = np.where(both, result["b_positive"] - result["b"], np.nan)
+    result["b_difference"] = difference
+    result["median_b_difference"] = (float(np.nanmedian(difference))
+                                     if both.any() else np.nan)
+
+    if verbose:
+        line = (f"  r={radius_km:4.1f} km  coverage={result['coverage']*100:5.1f}%  "
+               f"b={result['b_min']:.2f}..{result['b_max']:.2f}")
+        # b-positive is only computed when positive=True (the radius scan
+        # skips it - the choice of radius is made on coverage/contrast alone,
+        # and computing it at every radius would be needless cost); printing
+        # "median(b+ - b)=+nan" regardless, as if it had been tried and come
+        # up empty, would misreport a field that was simply never asked for.
+        if positive:
+            line += f"  median(b+ - b)={result['median_b_difference']:+.3f}"
+        print(line)
+    return result
+
+
 def heterogeneity(b):
     """
     How much b-value structure a map retains.
@@ -241,3 +382,118 @@ def compare_maps(first, second):
             "n_compared": int(both.sum()),
             "n_significant": int(np.nansum(d_aic > 2)),
             "n_highly_significant": int(np.nansum(d_aic > 5))}
+
+
+# ---------------------------------------------------------------------------
+# significance, corrected for multiple testing (Marzocchi, Zechar & Jordan
+# 2020 do not name this paper by title here; see PLAN.md Phase D /
+# doi:10.1093/gji/ggz541, "How to be fooled searching for significant
+# variations of the b-value")
+# ---------------------------------------------------------------------------
+
+def bonferroni(p_values, alpha=0.05):
+    """
+    Bonferroni family-wise correction: reject only p <= alpha / n_tested.
+
+    Reading the raw "dAIC > 2" node count from `compare_maps` as if every node
+    were an independent, pre-specified test is exactly the mistake Marzocchi
+    et al. (2020) warn against: at alpha = 0.05 you expect 5% of nodes to look
+    significant by chance even when nothing changed, and a dense grid tests
+    thousands of them. Bonferroni controls the probability of *any* false
+    positive across the whole grid - conservative, but simple to defend.
+
+    Args:
+        p_values (array-like): p-values (here, Utsu Pb from `compare_maps`),
+            any shape, NaN allowed where untested
+        alpha (float): family-wise error rate
+    Returns:
+        dict: n_tested, n_significant, threshold_p, reject (bool array, same
+              shape as `p_values`, False where NaN or not significant)
+    """
+    values = np.asarray(p_values, dtype=float)
+    finite = np.isfinite(values)
+    n = int(finite.sum())
+    reject = np.zeros(values.shape, dtype=bool)
+    if n == 0:
+        return {"n_tested": 0, "n_significant": 0, "threshold_p": np.nan,
+                "reject": reject}
+    threshold = alpha / n
+    reject[finite] = values[finite] <= threshold
+    return {"n_tested": n, "n_significant": int(reject.sum()),
+            "threshold_p": float(threshold), "reject": reject}
+
+
+def benjamini_hochberg(p_values, alpha=0.05):
+    """
+    Benjamini-Hochberg false-discovery-rate correction.
+
+    Less conservative than `bonferroni`: controls the *expected proportion* of
+    significant nodes that are false discoveries, rather than the probability
+    of any false positive at all. Both are legitimate; Marzocchi et al. (2020)
+    do not mandate one, only that some correction replaces the raw count.
+
+    Args:
+        p_values (array-like): p-values, any shape, NaN allowed where untested
+        alpha (float): target false discovery rate
+    Returns:
+        dict: n_tested, n_significant, threshold_p (the largest p that still
+              passes), reject (bool array, same shape as `p_values`)
+    """
+    values = np.asarray(p_values, dtype=float)
+    finite = np.isfinite(values)
+    flat = values[finite]
+    n = flat.size
+    reject = np.zeros(values.shape, dtype=bool)
+    if n == 0:
+        return {"n_tested": 0, "n_significant": 0, "threshold_p": np.nan,
+                "reject": reject}
+
+    order = np.argsort(flat)
+    sorted_p = flat[order]
+    ranks = np.arange(1, n + 1)
+    passing = np.where(sorted_p <= ranks / n * alpha)[0]
+    if passing.size == 0:
+        return {"n_tested": n, "n_significant": 0, "threshold_p": np.nan,
+                "reject": reject}
+
+    cutoff = int(passing.max())
+    flat_reject = np.zeros(n, dtype=bool)
+    flat_reject[order[:cutoff + 1]] = True
+    reject[finite] = flat_reject
+    return {"n_tested": n, "n_significant": cutoff + 1,
+            "threshold_p": float(sorted_p[cutoff]), "reject": reject}
+
+
+def effective_samples(radius_km, region_area_km2=None, length_km=None,
+                      width_km=None):
+    """
+    How many genuinely independent samples a dense grid's area actually holds.
+
+    Neighbouring nodes spaced closer than the sampling radius share most of
+    their events, so the node count from a dense grid vastly overstates the
+    number of independent tests - the root cause of the multiple-testing
+    problem `bonferroni`/`benjamini_hochberg` correct for. This estimates the
+    honest count as non-overlapping disks (map view) or non-overlapping
+    along-section spans (section view) tiling the same area, i.e. what you
+    would get by literally re-sampling on a grid spaced 2*radius apart.
+
+    This is an estimate, not a substitute for actually re-running the
+    comparison on a non-overlapping grid (which is what step 5 also does, and
+    is the more defensible number for a headline claim) - use this to sanity
+    check that number, not instead of it.
+
+    Args:
+        radius_km (float): sampling radius
+        region_area_km2 (float): map-view area; give this OR length_km
+        length_km (float): section length (section view)
+        width_km (float): section width (section view; sampling is 2-D along
+            the section, not 3-D, so only length tiles - width is the sampling
+            volume's other axis already, not additional independent area)
+    Returns:
+        int: estimated number of independent samples
+    """
+    if region_area_km2 is not None:
+        return max(1, int(region_area_km2 / (np.pi * radius_km ** 2)))
+    if length_km is not None:
+        return max(1, int(length_km / (2 * radius_km)))
+    raise ValueError("give region_area_km2 or length_km")
